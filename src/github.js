@@ -1,13 +1,14 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // AG Sync — GitHub Sync Backend
 // Push/pull AG data to/from a private GitHub repository
+// All shell commands use 'cmd /c' for Windows EOF signal compliance
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync, exec } = require('child_process');
+const { execSync } = require('child_process');
 const scanner = require('./scanner');
 const syncState = require('./syncState');
 
@@ -21,87 +22,83 @@ Thumbs.db
 *.log
 `.trim();
 
-/**
- * Store GitHub PAT in VS Code SecretStorage
- */
+// ── Shell helper — ALL commands go through cmd /c ────────────────────────────
+function shell(command, opts = {}) {
+    const defaults = { encoding: 'utf8', windowsHide: true, timeout: 15000 };
+    return execSync(`cmd /c ${command}`, { ...defaults, ...opts });
+}
+
+// ── Token management ─────────────────────────────────────────────────────────
+
 async function storeToken(context, token) {
     await context.secrets.store('agSync.githubToken', token);
 }
 
-/**
- * Get GitHub PAT from VS Code SecretStorage
- */
 async function getToken(context) {
     return await context.secrets.get('agSync.githubToken');
 }
 
-/**
- * Delete stored token
- */
 async function deleteToken(context) {
     await context.secrets.delete('agSync.githubToken');
 }
 
-/**
- * Check if gh CLI is available and authenticated
- */
+// ── GitHub CLI checks ────────────────────────────────────────────────────────
+
 function isGhCliAvailable() {
     try {
-        const result = execSync('gh auth status 2>&1', {
-            encoding: 'utf8',
-            windowsHide: true,
-            timeout: 10000
-        });
+        const result = shell('gh auth status 2>&1', { timeout: 8000 });
         return result.includes('Logged in');
     } catch (e) {
+        // execSync throws on non-zero exit, but gh auth status may still
+        // output "Logged in" on stderr captured by 2>&1
+        try {
+            if (e.stdout && e.stdout.includes('Logged in')) return true;
+            if (e.stderr && e.stderr.includes('Logged in')) return true;
+            if (e.output) {
+                const combined = e.output.map(b => b ? b.toString() : '').join('');
+                if (combined.includes('Logged in')) return true;
+            }
+        } catch (e2) { /* give up */ }
         return false;
     }
 }
 
-/**
- * Get the authenticated GitHub username
- */
 function getGhUsername() {
     try {
-        const result = execSync('gh auth status 2>&1', {
-            encoding: 'utf8',
-            windowsHide: true,
-            timeout: 10000
-        });
+        const result = shell('gh auth status 2>&1', { timeout: 8000 });
         const match = result.match(/account\s+(\S+)/);
         return match ? match[1] : null;
     } catch (e) {
-        return null;
+        // Same pattern — check stderr/stdout for account info
+        try {
+            const combined = [e.stdout, e.stderr, ...(e.output || [])].filter(Boolean).join(' ');
+            const match = combined.match(/account\s+(\S+)/);
+            return match ? match[1] : null;
+        } catch (e2) { return null; }
     }
 }
 
-/**
- * Create a private GitHub repo for sync data
- */
 async function createSyncRepo(repoName) {
     try {
-        const result = execSync(
+        const result = shell(
             `gh repo create ${repoName} --private --description "Antigravity Sync Data" 2>&1`,
-            { encoding: 'utf8', windowsHide: true, timeout: 30000 }
+            { timeout: 30000 }
         );
         return { success: true, url: result.trim() };
     } catch (e) {
-        // Repo may already exist
-        if (e.stderr && e.stderr.includes('already exists')) {
+        const msg = [e.stdout, e.stderr].filter(Boolean).join(' ');
+        if (msg.includes('already exists')) {
             return { success: true, url: `https://github.com/${repoName}`, existing: true };
         }
-        return { success: false, error: e.message };
+        return { success: false, error: msg || e.message };
     }
 }
 
-/**
- * List user's repos that match the sync pattern
- */
 function listSyncRepos() {
     try {
-        const result = execSync(
+        const result = shell(
             'gh repo list --json nameWithOwner,description,isPrivate --limit 50 2>&1',
-            { encoding: 'utf8', windowsHide: true, timeout: 15000 }
+            { timeout: 15000 }
         );
         return JSON.parse(result);
     } catch (e) {
@@ -109,40 +106,26 @@ function listSyncRepos() {
     }
 }
 
-/**
- * Prepare local git staging area
- */
+// ── Git operations ───────────────────────────────────────────────────────────
+
 function prepareLocalRepo(repoUrl) {
-    // Clean up any existing staging
     if (fs.existsSync(SYNC_DIR)) {
         fs.rmSync(SYNC_DIR, { recursive: true, force: true });
     }
-
     fs.mkdirSync(SYNC_DIR, { recursive: true });
 
     try {
-        // Try to clone existing repo
-        execSync(`git clone "${repoUrl}" "${SYNC_DIR}" 2>&1`, {
-            encoding: 'utf8',
-            windowsHide: true,
-            timeout: 120000
-        });
+        shell(`git clone "${repoUrl}" "${SYNC_DIR}" 2>&1`, { timeout: 120000 });
         return true;
     } catch (e) {
         // Init fresh repo if clone fails (empty repo)
-        execSync('git init', { cwd: SYNC_DIR, encoding: 'utf8', windowsHide: true });
-        execSync(`git remote add origin "${repoUrl}"`, { cwd: SYNC_DIR, encoding: 'utf8', windowsHide: true });
-        // Set default branch
-        try {
-            execSync('git checkout -b main', { cwd: SYNC_DIR, encoding: 'utf8', windowsHide: true });
-        } catch (e) { /* already on main */ }
+        shell('git init', { cwd: SYNC_DIR });
+        shell(`git remote add origin "${repoUrl}"`, { cwd: SYNC_DIR });
+        try { shell('git checkout -b main', { cwd: SYNC_DIR }); } catch (e2) { }
         return true;
     }
 }
 
-/**
- * Push selected categories to GitHub
- */
 async function pushToGithub(state, categorySelections, progress) {
     if (!state.githubRepo) {
         throw new Error('No GitHub repo configured. Run "AG Sync: Select/Create Sync Repo" first.');
@@ -160,10 +143,8 @@ async function pushToGithub(state, categorySelections, progress) {
     fs.mkdirSync(stagingAG, { recursive: true });
     fs.mkdirSync(stagingGR, { recursive: true });
 
-    // Write .gitignore
     fs.writeFileSync(path.join(SYNC_DIR, '.gitignore'), GITIGNORE_CONTENT, 'utf8');
 
-    // Copy selected categories
     const selectedCats = Object.keys(categorySelections).filter(id => categorySelections[id]);
     let totalFiles = 0;
 
@@ -201,7 +182,7 @@ async function pushToGithub(state, categorySelections, progress) {
         }
     }
 
-    // Write sync metadata
+    // Sync metadata
     const syncMeta = {
         lastPush: new Date().toISOString(),
         machine: state.machineId,
@@ -209,101 +190,69 @@ async function pushToGithub(state, categorySelections, progress) {
         categories: selectedCats,
         fileCount: totalFiles
     };
-    fs.writeFileSync(
-        path.join(SYNC_DIR, '_ag_sync_meta.json'),
-        JSON.stringify(syncMeta, null, 2),
-        'utf8'
-    );
+    fs.writeFileSync(path.join(SYNC_DIR, '_ag_sync_meta.json'), JSON.stringify(syncMeta, null, 2), 'utf8');
 
-    // Git add, commit, push
+    // Git operations
     progress?.report({ message: 'Committing changes...', increment: 20 });
+    const gitOpts = { cwd: SYNC_DIR, timeout: 300000 };
 
-    const gitOpts = { cwd: SYNC_DIR, encoding: 'utf8', windowsHide: true, timeout: 300000 };
+    shell('git add -A', gitOpts);
 
-    execSync('git add -A', gitOpts);
-
-    // Check if there are changes to commit
     try {
-        const status = execSync('git status --porcelain', gitOpts).trim();
-        if (!status) {
-            return { success: true, message: 'No changes to push.', filesCount: 0 };
-        }
-    } catch (e) { /* continue anyway */ }
+        const status = shell('git status --porcelain', gitOpts).trim();
+        if (!status) return { success: true, message: 'No changes to push.', filesCount: 0 };
+    } catch (e) { }
 
     const commitMsg = `AG Sync: ${new Date().toISOString()} from ${os.hostname()} (${totalFiles} files)`;
     try {
-        execSync(`git commit -m "${commitMsg}"`, gitOpts);
+        shell(`git commit -m "${commitMsg}"`, gitOpts);
     } catch (e) {
-        // If nothing to commit, that's fine
-        if (e.message.includes('nothing to commit')) {
-            return { success: true, message: 'Already up to date.', filesCount: 0 };
-        }
+        const msg = [e.stdout, e.stderr].filter(Boolean).join(' ');
+        if (msg.includes('nothing to commit')) return { success: true, message: 'Already up to date.', filesCount: 0 };
         throw e;
     }
 
     progress?.report({ message: 'Pushing to GitHub...', increment: 30 });
-
     try {
-        execSync('git push -u origin main --force', gitOpts);
+        shell('git push -u origin main --force 2>&1', gitOpts);
     } catch (e) {
-        // Try setting upstream on first push
         try {
-            execSync('git push --set-upstream origin main --force', gitOpts);
+            shell('git push --set-upstream origin main --force 2>&1', gitOpts);
         } catch (e2) {
             throw new Error(`Push failed: ${e2.message}`);
         }
     }
 
-    // Get commit SHA
     let commitSha = null;
-    try {
-        commitSha = execSync('git rev-parse HEAD', gitOpts).trim();
-    } catch (e) { /* ok */ }
+    try { commitSha = shell('git rev-parse HEAD', gitOpts).trim(); } catch (e) { }
 
-    // Update state
     state.lastPushTime = new Date().toISOString();
     state.lastPushCommit = commitSha;
     state.categorySelections = categorySelections;
 
-    // Update hashes
     const { currentHashes } = syncState.detectChanges(state, categorySelections);
     syncState.updateSyncHashes(state, currentHashes);
 
     syncState.addHistoryEntry(state, {
-        action: 'push',
-        commit: commitSha,
-        filesCount: totalFiles,
-        categories: selectedCats
+        action: 'push', commit: commitSha, filesCount: totalFiles, categories: selectedCats
     });
 
-    // Cleanup
     try { fs.rmSync(SYNC_DIR, { recursive: true, force: true }); } catch (e) { }
 
     return { success: true, message: `Pushed ${totalFiles} files.`, filesCount: totalFiles, commit: commitSha };
 }
 
-/**
- * Pull from GitHub and merge into local AG data
- */
 async function pullFromGithub(state, categorySelections, conflictMode, progress) {
-    if (!state.githubRepo) {
-        throw new Error('No GitHub repo configured.');
-    }
+    if (!state.githubRepo) throw new Error('No GitHub repo configured.');
 
     const repoUrl = `https://github.com/${state.githubRepo}.git`;
 
     progress?.report({ message: 'Cloning from GitHub...', increment: 10 });
 
-    if (fs.existsSync(SYNC_DIR)) {
-        fs.rmSync(SYNC_DIR, { recursive: true, force: true });
-    }
+    if (fs.existsSync(SYNC_DIR)) fs.rmSync(SYNC_DIR, { recursive: true, force: true });
 
     try {
-        execSync(`git clone "${repoUrl}" "${SYNC_DIR}" 2>&1`, {
-            encoding: 'utf8',
-            windowsHide: true,
-            timeout: 300000
-        });
+        shell(`git clone "${repoUrl}" "${SYNC_DIR}" 2>&1`, { timeout: 300000 });
     } catch (e) {
         throw new Error(`Clone failed: ${e.message}`);
     }
@@ -313,17 +262,12 @@ async function pullFromGithub(state, categorySelections, conflictMode, progress)
     let filesImported = 0;
     let filesSkipped = 0;
 
-    // Merge antigravity directory
     const srcAG = path.join(SYNC_DIR, 'antigravity');
     if (fs.existsSync(srcAG)) {
         const entries = fs.readdirSync(srcAG, { withFileTypes: true });
         for (const entry of entries) {
-            // Check category filter
             const catId = identifyCategory(entry.name);
-            if (catId && categorySelections && categorySelections[catId] === false) {
-                filesSkipped++;
-                continue;
-            }
+            if (catId && categorySelections && categorySelections[catId] === false) { filesSkipped++; continue; }
 
             const srcPath = path.join(srcAG, entry.name);
             const dstPath = path.join(scanner.AG_ROOT, entry.name);
@@ -342,44 +286,29 @@ async function pullFromGithub(state, categorySelections, conflictMode, progress)
         }
     }
 
-    // Merge gemini-root
     const srcGR = path.join(SYNC_DIR, 'gemini-root');
     if (fs.existsSync(srcGR)) {
-        const entries = fs.readdirSync(srcGR);
-        for (const file of entries) {
+        for (const file of fs.readdirSync(srcGR)) {
             const srcPath = path.join(srcGR, file);
             const dstPath = path.join(scanner.GEMINI_ROOT, file);
-            if (fs.statSync(srcPath).isFile()) {
-                fs.copyFileSync(srcPath, dstPath);
-                filesImported++;
-            }
+            if (fs.statSync(srcPath).isFile()) { fs.copyFileSync(srcPath, dstPath); filesImported++; }
         }
     }
 
-    // Get commit SHA
     let commitSha = null;
-    try {
-        commitSha = execSync('git rev-parse HEAD', { cwd: SYNC_DIR, encoding: 'utf8', windowsHide: true }).trim();
-    } catch (e) { }
+    try { commitSha = shell('git rev-parse HEAD', { cwd: SYNC_DIR }).trim(); } catch (e) { }
 
-    // Update state
     state.lastPullTime = new Date().toISOString();
     state.lastPullCommit = commitSha;
 
-    syncState.addHistoryEntry(state, {
-        action: 'pull',
-        commit: commitSha,
-        filesImported,
-        filesSkipped
-    });
+    syncState.addHistoryEntry(state, { action: 'pull', commit: commitSha, filesImported, filesSkipped });
 
-    // Cleanup
     try { fs.rmSync(SYNC_DIR, { recursive: true, force: true }); } catch (e) { }
 
     return { success: true, filesImported, filesSkipped, commit: commitSha };
 }
 
-// ── Utility functions ────────────────────────────────────────────────────────
+// ── Utilities ────────────────────────────────────────────────────────────────
 
 function identifyCategory(name) {
     const map = {
@@ -396,33 +325,24 @@ function identifyCategory(name) {
 function copyDirRecursive(src, dst) {
     fs.mkdirSync(dst, { recursive: true });
     try {
-        const entries = fs.readdirSync(src, { withFileTypes: true });
-        for (const entry of entries) {
-            const s = path.join(src, entry.name);
-            const d = path.join(dst, entry.name);
-            try {
-                if (entry.isDirectory()) copyDirRecursive(s, d);
-                else fs.copyFileSync(s, d);
-            } catch (e) { /* skip unreadable */ }
+        for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+            const s = path.join(src, entry.name), d = path.join(dst, entry.name);
+            try { entry.isDirectory() ? copyDirRecursive(s, d) : fs.copyFileSync(s, d); } catch (e) { }
         }
     } catch (e) { }
 }
 
-function mergeDirRecursive(src, dst, conflictMode) {
+function mergeDirRecursive(src, dst, mode) {
     const result = { imported: 0, skipped: 0 };
     fs.mkdirSync(dst, { recursive: true });
     try {
-        const entries = fs.readdirSync(src, { withFileTypes: true });
-        for (const entry of entries) {
-            const s = path.join(src, entry.name);
-            const d = path.join(dst, entry.name);
+        for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+            const s = path.join(src, entry.name), d = path.join(dst, entry.name);
             if (entry.isDirectory()) {
-                const sub = mergeDirRecursive(s, d, conflictMode);
-                result.imported += sub.imported;
-                result.skipped += sub.skipped;
+                const sub = mergeDirRecursive(s, d, mode);
+                result.imported += sub.imported; result.skipped += sub.skipped;
             } else {
-                if (mergeFile(s, d, conflictMode)) result.imported++;
-                else result.skipped++;
+                mergeFile(s, d, mode) ? result.imported++ : result.skipped++;
             }
         }
     } catch (e) { }
@@ -431,47 +351,17 @@ function mergeDirRecursive(src, dst, conflictMode) {
 
 function mergeFile(src, dst, mode) {
     try {
-        if (!fs.existsSync(dst)) {
-            fs.mkdirSync(path.dirname(dst), { recursive: true });
-            fs.copyFileSync(src, dst);
-            return true;
-        }
+        if (!fs.existsSync(dst)) { fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.copyFileSync(src, dst); return true; }
         if (mode === 'skip') return false;
-        if (mode === 'newer-wins') {
-            if (fs.statSync(src).mtimeMs > fs.statSync(dst).mtimeMs) {
-                fs.copyFileSync(src, dst);
-                return true;
-            }
-            return false;
-        }
-        // default: overwrite
-        fs.copyFileSync(src, dst);
-        return true;
-    } catch (e) {
-        return false;
-    }
+        if (mode === 'newer-wins' && fs.statSync(src).mtimeMs <= fs.statSync(dst).mtimeMs) return false;
+        fs.copyFileSync(src, dst); return true;
+    } catch (e) { return false; }
 }
 
 function countFiles(dir) {
     let count = 0;
-    try {
-        const entries = fs.readdirSync(dir, { withFileTypes: true });
-        for (const e of entries) {
-            if (e.isDirectory()) count += countFiles(path.join(dir, e.name));
-            else count++;
-        }
-    } catch (e) { }
+    try { for (const e of fs.readdirSync(dir, { withFileTypes: true })) count += e.isDirectory() ? countFiles(path.join(dir, e.name)) : 1; } catch (e) { }
     return count;
 }
 
-module.exports = {
-    storeToken,
-    getToken,
-    deleteToken,
-    isGhCliAvailable,
-    getGhUsername,
-    createSyncRepo,
-    listSyncRepos,
-    pushToGithub,
-    pullFromGithub
-};
+module.exports = { storeToken, getToken, deleteToken, isGhCliAvailable, getGhUsername, createSyncRepo, listSyncRepos, pushToGithub, pullFromGithub };

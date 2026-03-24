@@ -117,28 +117,51 @@ function activate(context) {
 
     // 3. Dashboard
     context.subscriptions.push(vscode.commands.registerCommand('agSync.dashboard', () => {
-        dashboard.createOrShow(context, context.extensionUri);
+        dashboard.createOrShow(context);
     }));
 
     // 4. GitHub Login
     context.subscriptions.push(vscode.commands.registerCommand('agSync.githubLogin', async () => {
-        if (github.isGhCliAvailable()) {
-            const user = github.getGhUsername();
-            vscode.window.showInformationMessage(`Already connected as ${user} via GitHub CLI.`);
-            return;
+        try {
+            const ghAvail = github.isGhCliAvailable();
+            if (ghAvail) {
+                const user = github.getGhUsername();
+                const state = syncState.loadState();
+                if (state.githubRepo) {
+                    vscode.window.showInformationMessage(
+                        `Connected as ${user || 'unknown'} | Sync repo: ${state.githubRepo}`
+                    );
+                } else {
+                    const action = await vscode.window.showInformationMessage(
+                        `Connected as ${user || 'unknown'} via GitHub CLI. Set up a sync repo?`,
+                        'Set Up Repo', 'Cancel'
+                    );
+                    if (action === 'Set Up Repo') {
+                        await vscode.commands.executeCommand('agSync.githubSelectRepo');
+                    }
+                }
+            } else {
+                const choice = await vscode.window.showWarningMessage(
+                    'GitHub CLI (gh) not found or not authenticated. Install gh CLI and run "gh auth login", or enter a PAT.',
+                    'Enter PAT', 'Cancel'
+                );
+                if (choice === 'Enter PAT') {
+                    const token = await vscode.window.showInputBox({
+                        prompt: 'Enter your GitHub Personal Access Token',
+                        password: true,
+                        placeHolder: 'ghp_xxxx...',
+                        ignoreFocusOut: true
+                    });
+                    if (token) {
+                        await github.storeToken(context, token);
+                        vscode.window.showInformationMessage('GitHub token saved.');
+                    }
+                }
+            }
+            dashboard.refresh(context);
+        } catch (e) {
+            vscode.window.showErrorMessage(`GitHub check failed: ${e.message}`);
         }
-
-        const token = await vscode.window.showInputBox({
-            prompt: 'Enter your GitHub Personal Access Token',
-            password: true,
-            placeHolder: 'ghp_xxxx...',
-            ignoreFocusOut: true
-        });
-        if (!token) return;
-
-        await github.storeToken(context, token);
-        vscode.window.showInformationMessage('GitHub token saved securely.');
-        dashboard.refresh(context);
     }));
 
     // 5. GitHub Logout
@@ -309,21 +332,21 @@ function activate(context) {
     // 10. Status
     context.subscriptions.push(vscode.commands.registerCommand('agSync.status', async () => {
         const state = syncState.loadState();
-        const scanResult = scanner.scanAll();
-        const ghAvail = github.isGhCliAvailable();
+        let ghAvail = false;
+        let ghUser = null;
+        try { ghAvail = github.isGhCliAvailable(); if (ghAvail) ghUser = github.getGhUsername(); } catch (e) { }
 
         const lines = [
-            `GitHub: ${ghAvail ? 'Connected (' + github.getGhUsername() + ')' : 'Not connected'}`,
+            `GitHub: ${ghAvail ? 'Connected (' + (ghUser || '?') + ')' : 'Not connected'}`,
             `Sync Repo: ${state.githubRepo || 'Not configured'}`,
             `Last Push: ${state.lastPushTime || 'Never'}`,
             `Last Pull: ${state.lastPullTime || 'Never'}`,
-            `Total Data: ${scanResult.grandTotalFiles} files (${scanResult.grandTotalSizeFormatted})`,
             '',
-            `Categories:`
+            'Categories: (use AG Sync: Scan Data for full file counts)'
         ];
 
-        for (const [id, cat] of Object.entries(scanResult.categories)) {
-            lines.push(`  ${cat.label}: ${cat.fileCount} files (${cat.totalSizeFormatted})`);
+        for (const [id, cat] of Object.entries(scanner.CATEGORIES)) {
+            lines.push(`  ${cat.label}: ${cat.description}`);
         }
 
         const doc = await vscode.workspace.openTextDocument({
@@ -436,17 +459,16 @@ function activate(context) {
 // ── Helper: Category picker ──────────────────────────────────────────────────
 
 async function pickCategories(actionLabel) {
-    const scanResult = scanner.scanAll();
     const excludes = vscode.workspace.getConfiguration('agSync').get('excludeCategories', []);
     const state = syncState.loadState();
     const savedSelections = state.categorySelections;
 
-    const items = Object.entries(scanResult.categories).map(([id, cat]) => {
+    // Use CATEGORIES definitions directly — no slow full scan
+    const items = Object.entries(scanner.CATEGORIES).map(([id, cat]) => {
         const isIncluded = savedSelections ? savedSelections[id] !== false : !excludes.includes(id);
         return {
             label: cat.label,
-            description: `${cat.fileCount} files (${cat.totalSizeFormatted})`,
-            detail: cat.description,
+            description: cat.description,
             picked: isIncluded,
             categoryId: id
         };
