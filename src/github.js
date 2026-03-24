@@ -216,9 +216,8 @@ function copyDirTracked(src, dst, tracker) {
                     fs.copyFileSync(s, d);
                     tracker.copied++;
                     if (tracker.copied % 100 === 0) {
-                        const pct = tracker.total > 0 ? Math.floor((tracker.copied / tracker.total) * 50) + 10 : 30;
                         tracker.progress?.report({
-                            message: `[3/7] Copying files: ${tracker.copied.toLocaleString()}${tracker.total > 0 ? '/' + tracker.total.toLocaleString() : ''} (${elapsed(tracker.startMs)})`,
+                            message: `[3/7] Copying files: ${tracker.copied.toLocaleString()} copied (${elapsed(tracker.startMs)})`,
                             increment: 1
                         });
                     }
