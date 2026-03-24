@@ -1,9 +1,3 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// AG Sync — GitHub Sync Backend
-// Push/pull AG data to/from a private GitHub repository
-// All shell commands use 'cmd /c' for Windows EOF signal compliance
-// ═══════════════════════════════════════════════════════════════════════════════
-
 const vscode = require('vscode');
 const fs = require('fs');
 const path = require('path');
@@ -12,24 +6,48 @@ const { execSync } = require('child_process');
 const scanner = require('./scanner');
 const syncState = require('./syncState');
 
-const SYNC_BASE = path.join(os.tmpdir(), 'ag-sync');
-const GITIGNORE_CONTENT = `
-# AG Sync gitignore
-node_modules/
-*.vsix
-.DS_Store
-Thumbs.db
-*.log
-`.trim();
+// Persistent git dir — lives inside AG data, persists between pushes for incremental sync
+const PERSISTENT_GIT_DIR = path.join(scanner.AG_ROOT, '.ag-sync-repo');
+// Temp dir only used for pull (needs to clone from remote)
+const PULL_TMP_BASE = path.join(os.tmpdir(), 'ag-sync-pull');
 
-// Generate a unique staging dir per operation (avoids EBUSY on locked files from prior runs)
-function makeSyncDir() {
-    const dir = path.join(SYNC_BASE, `op-${Date.now()}`);
-    fs.mkdirSync(dir, { recursive: true });
-    return dir;
+// ── Shell helper — ALL commands go through cmd /c ────────────────────────────
+function shell(command, opts = {}) {
+    const defaults = { encoding: 'utf8', windowsHide: true, timeout: 15000 };
+    return execSync(`cmd /c ${command}`, { ...defaults, ...opts });
 }
 
-// Safe cleanup with retry for Windows file locks (antivirus, indexer, etc.)
+// Git command helper — uses GIT_DIR + GIT_WORK_TREE so git reads files in-place
+function gitCmd(command, extraOpts = {}) {
+    const env = {
+        ...process.env,
+        GIT_DIR: PERSISTENT_GIT_DIR,
+        GIT_WORK_TREE: scanner.AG_ROOT
+    };
+    const defaults = { encoding: 'utf8', windowsHide: true, timeout: 120000, env };
+    return execSync(`cmd /c git ${command}`, { ...defaults, ...extraOpts });
+}
+
+// Initialize or verify the persistent git repo
+function ensurePersistentRepo(repoUrl) {
+    if (!fs.existsSync(PERSISTENT_GIT_DIR)) {
+        fs.mkdirSync(PERSISTENT_GIT_DIR, { recursive: true });
+        gitCmd('init --bare');
+        gitCmd(`remote add origin "${repoUrl}"`);
+    } else {
+        // Ensure remote is correct
+        try {
+            const current = gitCmd('remote get-url origin').trim();
+            if (current !== repoUrl) {
+                gitCmd(`remote set-url origin "${repoUrl}"`);
+            }
+        } catch (e) {
+            try { gitCmd(`remote add origin "${repoUrl}"`); } catch (e2) { }
+        }
+    }
+}
+
+// Safe cleanup with retry for Windows file locks
 function safeCleanup(dir) {
     if (!dir || !fs.existsSync(dir)) return;
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -38,24 +56,10 @@ function safeCleanup(dir) {
             return;
         } catch (e) {
             if (attempt < 2) {
-                // Wait a bit for Windows to release locks
                 try { execSync('cmd /c timeout /t 1 /nobreak >nul 2>&1', { windowsHide: true, timeout: 3000 }); } catch (e2) { }
             }
         }
     }
-    // Last resort: schedule cleanup via cmd
-    try { execSync(`cmd /c "start /min cmd /c timeout /t 5 && rd /s /q "${dir}""`, { windowsHide: true }); } catch (e) { }
-}
-
-// Clean up old staging dirs from prior runs
-function cleanOldStagingDirs() {
-    try {
-        if (!fs.existsSync(SYNC_BASE)) return;
-        for (const entry of fs.readdirSync(SYNC_BASE)) {
-            const full = path.join(SYNC_BASE, entry);
-            try { fs.rmSync(full, { recursive: true, force: true }); } catch (e) { /* locked, skip */ }
-        }
-    } catch (e) { }
 }
 
 // ── Shell helper — ALL commands go through cmd /c ────────────────────────────
@@ -256,9 +260,6 @@ function quickCountFiles(dirs, baseDir) {
 
 async function pushToGithub(state, categorySelections, progress) {
     const t0 = Date.now();
-    const workDir = scanner.AG_ROOT;
-    const gitDir = path.join(workDir, '.git');
-    const hadGit = fs.existsSync(gitDir);
 
     // Phase 0: Ensure repo
     progress?.report({ message: `[0/4] Checking repo config... (${elapsed(t0)})`, increment: 2 });
@@ -266,230 +267,195 @@ async function pushToGithub(state, categorySelections, progress) {
     progress?.report({ message: `[0/4] Repo: ${state.githubRepo} (${elapsed(t0)})`, increment: 3 });
 
     const repoUrl = `https://github.com/${state.githubRepo}.git`;
-    const gitOpts = { cwd: workDir, timeout: 600000 };
 
-    try {
-        // Phase 1: Init git directly in the AG data directory
-        progress?.report({ message: `[1/4] Initializing git... (${elapsed(t0)})`, increment: 5 });
-        if (!hadGit) {
-            shell('git init', gitOpts);
-            shell(`git remote add origin "${repoUrl}"`, gitOpts);
-            try { shell('git checkout -b main', gitOpts); } catch (e) { }
-        }
+    // Phase 1: Ensure persistent git repo
+    progress?.report({ message: `[1/4] Setting up persistent repo... (${elapsed(t0)})`, increment: 5 });
+    ensurePersistentRepo(repoUrl);
+    progress?.report({ message: `[1/4] Repo ready. (${elapsed(t0)})`, increment: 5 });
 
-        // Write sync metadata
-        const selectedCats = Object.keys(categorySelections).filter(id => categorySelections[id]);
-        const syncMeta = {
-            lastPush: new Date().toISOString(),
-            machine: state.machineId,
-            hostname: os.hostname(),
-            categories: selectedCats
-        };
-        fs.writeFileSync(path.join(workDir, '_ag_sync_meta.json'), JSON.stringify(syncMeta, null, 2), 'utf8');
+    const selectedCats = Object.keys(categorySelections).filter(id => categorySelections[id]);
 
-        // Phase 2: git add selected categories
-        progress?.report({ message: `[2/4] Adding files to git... (${elapsed(t0)})`, increment: 5 });
+    // Phase 2: Stage selected files (git reads directly from source — no copies)
+    progress?.report({ message: `[2/4] Staging files... (${elapsed(t0)})`, increment: 5 });
 
-        // Add specific dirs/files for each selected category
-        for (const catId of selectedCats) {
-            const catDef = scanner.CATEGORIES[catId];
-            if (!catDef) continue;
-            progress?.report({ message: `[2/4] Adding ${catDef.label}... (${elapsed(t0)})` });
+    // Reset index to start fresh staging
+    try { gitCmd('rm -r --cached . 2>&1', { timeout: 300000 }); } catch (e) { }
 
-            for (const dir of (catDef.dirs || [])) {
-                const dirPath = path.join(workDir, dir);
-                if (fs.existsSync(dirPath)) {
-                    try { shell(`git add -f "${dir}"`, gitOpts); } catch (e) { }
-                }
-            }
-            for (const file of (catDef.files || [])) {
-                const filePath = path.join(workDir, file);
-                if (fs.existsSync(filePath)) {
-                    try { shell(`git add -f "${file}"`, gitOpts); } catch (e) { }
-                }
+    for (const catId of selectedCats) {
+        const catDef = scanner.CATEGORIES[catId];
+        if (!catDef) continue;
+        progress?.report({ message: `[2/4] Adding ${catDef.label}... (${elapsed(t0)})` });
+
+        for (const dir of (catDef.dirs || [])) {
+            const dirPath = path.join(scanner.AG_ROOT, dir);
+            if (fs.existsSync(dirPath)) {
+                try { gitCmd(`add -f -- "${dir}"`, { timeout: 300000 }); } catch (e) { }
             }
         }
-        // Add metadata
-        try { shell('git add -f _ag_sync_meta.json', gitOpts); } catch (e) { }
-
-        progress?.report({ message: `[2/4] Files added. (${elapsed(t0)})`, increment: 10 });
-
-        // Count staged files
-        let totalFiles = 0;
-        try {
-            const ls = shell('git diff --cached --name-only', gitOpts).trim();
-            totalFiles = ls ? ls.split('\n').length : 0;
-        } catch (e) { }
-
-        // Check for changes
-        try {
-            const status = shell('git status --porcelain', gitOpts).trim();
-            if (!status) {
-                progress?.report({ message: `[2/4] No changes. (${elapsed(t0)})`, increment: 50 });
-                return { success: true, message: 'No changes to push.', filesCount: 0 };
-            }
-        } catch (e) { }
-
-        // Commit
-        const commitMsg = `AG Sync: ${new Date().toISOString()} from ${os.hostname()}`;
-        progress?.report({ message: `[2/4] Committing... (${elapsed(t0)})`, increment: 5 });
-        try {
-            shell(`git commit -m "${commitMsg}"`, gitOpts);
-        } catch (e) {
-            const msg = [e.stdout, e.stderr].filter(Boolean).join(' ');
-            if (msg.includes('nothing to commit')) return { success: true, message: 'Already up to date.', filesCount: 0 };
-            throw e;
-        }
-
-        // Phase 3: Push
-        progress?.report({ message: `[3/4] Pushing to GitHub... (${elapsed(t0)})`, increment: 10 });
-        try {
-            shell('git push -u origin main --force 2>&1', gitOpts);
-        } catch (e) {
-            try {
-                shell('git push --set-upstream origin main --force 2>&1', gitOpts);
-            } catch (e2) {
-                throw new Error(`Push failed: ${e2.message}`);
+        for (const file of (catDef.files || [])) {
+            const filePath = path.join(scanner.AG_ROOT, file);
+            if (fs.existsSync(filePath)) {
+                try { gitCmd(`add -f -- "${file}"`, { timeout: 30000 }); } catch (e) { }
             }
         }
-        progress?.report({ message: `[3/4] Push complete. (${elapsed(t0)})`, increment: 10 });
-
-        let commitSha = null;
-        try { commitSha = shell('git rev-parse HEAD', gitOpts).trim(); } catch (e) { }
-
-        // Phase 4: Finalize
-        progress?.report({ message: `[4/4] Finalizing... (${elapsed(t0)})`, increment: 2 });
-
-        state.lastPushTime = new Date().toISOString();
-        state.lastPushCommit = commitSha;
-        state.categorySelections = categorySelections;
-
-        const { currentHashes } = syncState.detectChanges(state, categorySelections);
-        syncState.updateSyncHashes(state, currentHashes);
-
-        syncState.addHistoryEntry(state, {
-            action: 'push', commit: commitSha, filesCount: totalFiles, categories: selectedCats
-        });
-
-        const totalTime = elapsed(t0);
-        progress?.report({ message: `Done! Pushed in ${totalTime}`, increment: 5 });
-
-        return { success: true, message: `Pushed in ${totalTime}.`, filesCount: totalFiles, commit: commitSha };
-
-    } finally {
-        // Remove .git from AG data dir (we don't want it lingering)
-        if (!hadGit) {
-            try { fs.rmSync(gitDir, { recursive: true, force: true }); } catch (e) { }
-        }
-        // Clean up metadata file
-        try { fs.unlinkSync(path.join(workDir, '_ag_sync_meta.json')); } catch (e) { }
     }
+    progress?.report({ message: `[2/4] Files staged. (${elapsed(t0)})`, increment: 10 });
+
+    // Check for changes
+    let hasChanges = true;
+    try {
+        const status = gitCmd('status --porcelain').trim();
+        if (!status) hasChanges = false;
+    } catch (e) { }
+
+    if (!hasChanges) {
+        progress?.report({ message: `[2/4] No changes detected. (${elapsed(t0)})`, increment: 50 });
+        return { success: true, message: 'No changes to push.', filesCount: 0 };
+    }
+
+    // Commit
+    const commitMsg = `AG Sync: ${new Date().toISOString()} from ${os.hostname()}`;
+    progress?.report({ message: `[2/4] Committing... (${elapsed(t0)})`, increment: 5 });
+    try {
+        gitCmd(`commit -m "${commitMsg}"`, { timeout: 300000 });
+    } catch (e) {
+        const msg = [e.stdout, e.stderr].filter(Boolean).join(' ');
+        if (msg.includes('nothing to commit')) return { success: true, message: 'Already up to date.', filesCount: 0 };
+        throw e;
+    }
+
+    // Count committed files
+    let totalFiles = 0;
+    try {
+        const ls = gitCmd('diff --name-only HEAD~1..HEAD 2>&1').trim();
+        totalFiles = ls ? ls.split('\n').length : 0;
+    } catch (e) {
+        try {
+            const ls = gitCmd('ls-tree -r --name-only HEAD').trim();
+            totalFiles = ls ? ls.split('\n').length : 0;
+        } catch (e2) { }
+    }
+
+    // Phase 3: Push
+    progress?.report({ message: `[3/4] Pushing ${totalFiles.toLocaleString()} files to GitHub... (${elapsed(t0)})`, increment: 10 });
+    try {
+        gitCmd('push -u origin main --force 2>&1', { timeout: 600000 });
+    } catch (e) {
+        try {
+            gitCmd('push --set-upstream origin main --force 2>&1', { timeout: 600000 });
+        } catch (e2) {
+            throw new Error(`Push failed: ${e2.message}`);
+        }
+    }
+    progress?.report({ message: `[3/4] Push complete. (${elapsed(t0)})`, increment: 10 });
+
+    let commitSha = null;
+    try { commitSha = gitCmd('rev-parse HEAD').trim(); } catch (e) { }
+
+    // Phase 4: Finalize
+    progress?.report({ message: `[4/4] Finalizing... (${elapsed(t0)})`, increment: 2 });
+
+    state.lastPushTime = new Date().toISOString();
+    state.lastPushCommit = commitSha;
+    state.categorySelections = categorySelections;
+
+    const { currentHashes } = syncState.detectChanges(state, categorySelections);
+    syncState.updateSyncHashes(state, currentHashes);
+
+    syncState.addHistoryEntry(state, {
+        action: 'push', commit: commitSha, filesCount: totalFiles, categories: selectedCats
+    });
+
+    const totalTime = elapsed(t0);
+    progress?.report({ message: `Done! ${totalFiles.toLocaleString()} files pushed in ${totalTime}`, increment: 5 });
+
+    return { success: true, message: `Pushed ${totalFiles.toLocaleString()} files in ${totalTime}.`, filesCount: totalFiles, commit: commitSha };
 }
 
 async function pullFromGithub(state, categorySelections, conflictMode, progress) {
     const t0 = Date.now();
 
     // Phase 0: Ensure repo
-    progress?.report({ message: `[0/5] Checking repo config... (${elapsed(t0)})`, increment: 2 });
+    progress?.report({ message: `[0/4] Checking repo config... (${elapsed(t0)})`, increment: 2 });
     ensureRepo(state);
-    progress?.report({ message: `[0/5] Repo: ${state.githubRepo} (${elapsed(t0)})`, increment: 3 });
+    progress?.report({ message: `[0/4] Repo: ${state.githubRepo} (${elapsed(t0)})`, increment: 3 });
 
     const repoUrl = `https://github.com/${state.githubRepo}.git`;
 
-    // Create unique staging dir
-    cleanOldStagingDirs();
-    const syncDir = makeSyncDir();
+    // Create temp dir for clone (pull does need to download)
+    const pullDir = path.join(PULL_TMP_BASE, `pull-${Date.now()}`);
+    fs.mkdirSync(pullDir, { recursive: true });
 
     try {
         // Phase 1: Clone
-        progress?.report({ message: `[1/5] Cloning from GitHub (may take a moment)... (${elapsed(t0)})`, increment: 5 });
-
+        progress?.report({ message: `[1/4] Cloning from GitHub... (${elapsed(t0)})`, increment: 5 });
         try {
-            shell(`git clone "${repoUrl}" "${syncDir}" 2>&1`, { timeout: 300000 });
+            shell(`git clone --depth 1 "${repoUrl}" "${pullDir}" 2>&1`, { timeout: 600000 });
         } catch (e) {
             throw new Error(`Clone failed: ${e.message}`);
         }
-        progress?.report({ message: `[1/5] Clone complete. (${elapsed(t0)})`, increment: 10 });
+        progress?.report({ message: `[1/4] Clone complete. (${elapsed(t0)})`, increment: 10 });
 
-        // Phase 2: Count remote files
-        progress?.report({ message: `[2/5] Counting remote files... (${elapsed(t0)})`, increment: 2 });
-        let remoteFileCount = 0;
-        const srcAG = path.join(syncDir, 'antigravity');
-        if (fs.existsSync(srcAG)) {
-            remoteFileCount = countFiles(srcAG);
-        }
-        progress?.report({ message: `[2/5] ${remoteFileCount.toLocaleString()} files found in remote. (${elapsed(t0)})`, increment: 3 });
-
-        // Phase 3: Merge
+        // Phase 2: Merge files into AG data directory
         let filesImported = 0;
         let filesSkipped = 0;
 
-        if (fs.existsSync(srcAG)) {
-            const entries = fs.readdirSync(srcAG, { withFileTypes: true });
-            const totalEntries = entries.length;
-            let entryIdx = 0;
+        // The cloned repo has files at top level (same paths as AG_ROOT)
+        const entries = fs.readdirSync(pullDir, { withFileTypes: true })
+            .filter(e => e.name !== '.git' && e.name !== '_ag_sync_meta.json');
+        const totalEntries = entries.length;
+        let entryIdx = 0;
 
-            for (const entry of entries) {
-                entryIdx++;
-                const catId = identifyCategory(entry.name);
-                if (catId && categorySelections && categorySelections[catId] === false) {
-                    filesSkipped++;
-                    progress?.report({ message: `[3/5] Skipped ${entry.name} (excluded). (${elapsed(t0)})` });
-                    continue;
-                }
+        for (const entry of entries) {
+            entryIdx++;
+            const catId = identifyCategory(entry.name);
+            if (catId && categorySelections && categorySelections[catId] === false) {
+                filesSkipped++;
+                progress?.report({ message: `[2/4] Skipped ${entry.name} (excluded). (${elapsed(t0)})` });
+                continue;
+            }
 
-                const srcPath = path.join(srcAG, entry.name);
-                const dstPath = path.join(scanner.AG_ROOT, entry.name);
+            const srcPath = path.join(pullDir, entry.name);
+            const dstPath = path.join(scanner.AG_ROOT, entry.name);
 
+            progress?.report({
+                message: `[2/4] Importing ${entry.name} (${entryIdx}/${totalEntries})... (${elapsed(t0)})`,
+                increment: Math.floor(50 / Math.max(totalEntries, 1))
+            });
+
+            if (entry.isDirectory()) {
+                const result = mergeDirRecursive(srcPath, dstPath, conflictMode);
+                filesImported += result.imported;
+                filesSkipped += result.skipped;
                 progress?.report({
-                    message: `[3/5] Importing ${entry.name} (${entryIdx}/${totalEntries}, mode: ${conflictMode})... (${elapsed(t0)})`,
-                    increment: Math.floor(50 / totalEntries)
+                    message: `[2/4] ${entry.name}: ${result.imported} imported, ${result.skipped} skipped. (${elapsed(t0)})`
                 });
-
-                if (entry.isDirectory()) {
-                    const result = mergeDirRecursive(srcPath, dstPath, conflictMode);
-                    filesImported += result.imported;
-                    filesSkipped += result.skipped;
-                    progress?.report({
-                        message: `[3/5] ${entry.name}: ${result.imported} imported, ${result.skipped} skipped. (${elapsed(t0)})`
-                    });
-                } else {
-                    fs.mkdirSync(path.dirname(dstPath), { recursive: true });
-                    fs.copyFileSync(srcPath, dstPath);
-                    filesImported++;
-                }
+            } else {
+                fs.mkdirSync(path.dirname(dstPath), { recursive: true });
+                fs.copyFileSync(srcPath, dstPath);
+                filesImported++;
             }
         }
 
-        // Merge gemini-root
-        const srcGR = path.join(syncDir, 'gemini-root');
-        if (fs.existsSync(srcGR)) {
-            for (const file of fs.readdirSync(srcGR)) {
-                const srcPath = path.join(srcGR, file);
-                const dstPath = path.join(scanner.GEMINI_ROOT, file);
-                if (fs.statSync(srcPath).isFile()) { fs.copyFileSync(srcPath, dstPath); filesImported++; }
-            }
-        }
-
-        // Phase 4: Finalize
-        progress?.report({ message: `[4/5] Finalizing... (${elapsed(t0)})`, increment: 5 });
+        // Phase 3: Finalize
+        progress?.report({ message: `[3/4] Finalizing... (${elapsed(t0)})`, increment: 5 });
 
         let commitSha = null;
-        try { commitSha = shell('git rev-parse HEAD', { cwd: syncDir }).trim(); } catch (e) { }
+        try { commitSha = shell('git rev-parse HEAD', { cwd: pullDir }).trim(); } catch (e) { }
 
         state.lastPullTime = new Date().toISOString();
         state.lastPullCommit = commitSha;
 
         syncState.addHistoryEntry(state, { action: 'pull', commit: commitSha, filesImported, filesSkipped });
 
-        // Phase 5: Done
+        // Phase 4: Done
         const totalTime = elapsed(t0);
         progress?.report({ message: `Done! ${filesImported.toLocaleString()} imported, ${filesSkipped} skipped in ${totalTime}`, increment: 5 });
 
         return { success: true, filesImported, filesSkipped, commit: commitSha };
 
     } finally {
-        safeCleanup(syncDir);
+        safeCleanup(pullDir);
     }
 }
 
