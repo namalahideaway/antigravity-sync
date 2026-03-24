@@ -237,21 +237,12 @@ function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand('agSync.push', async () => {
         try {
             const state = syncState.loadState();
-            if (!state.githubRepo) {
-                const action = await vscode.window.showWarningMessage(
-                    'No sync repo configured.', 'Configure Now', 'Cancel'
-                );
-                if (action === 'Configure Now') {
-                    await vscode.commands.executeCommand('agSync.githubSelectRepo');
-                }
-                return;
-            }
 
-            // Use saved selections or pick new ones
+            // Use saved selections or default (ensureRepo auto-creates repo)
             let selections = state.categorySelections;
             if (!selections) {
-                selections = await pickCategories('Push');
-                if (!selections) return;
+                const excludes = vscode.workspace.getConfiguration('agSync').get('excludeCategories', []);
+                selections = scanner.getDefaultSelections(excludes);
             }
 
             updateStatusBar('pushing');
@@ -276,20 +267,17 @@ function activate(context) {
     context.subscriptions.push(vscode.commands.registerCommand('agSync.pull', async () => {
         try {
             const state = syncState.loadState();
-            if (!state.githubRepo) {
-                vscode.window.showWarningMessage('No sync repo configured.');
-                return;
-            }
 
-            const conflictMode = vscode.workspace.getConfiguration('agSync').get('conflictResolution', 'ask');
+            // Default to newer-wins for smart multi-machine merge
+            const conflictMode = vscode.workspace.getConfiguration('agSync').get('conflictResolution', 'newer-wins');
             let resolvedMode = conflictMode;
 
             if (conflictMode === 'ask') {
                 const pick = await vscode.window.showQuickPick(
                     [
-                        { label: 'Overwrite local', value: 'overwrite' },
-                        { label: 'Skip existing', value: 'skip' },
-                        { label: 'Newer wins', value: 'newer-wins' }
+                        { label: 'Newer wins (recommended)', description: 'Keep whichever file is more recent', value: 'newer-wins' },
+                        { label: 'Overwrite local', description: 'Replace all local with remote', value: 'overwrite' },
+                        { label: 'Skip existing', description: 'Keep local, only get new files', value: 'skip' }
                     ],
                     { placeHolder: 'How to handle conflicts?' }
                 );

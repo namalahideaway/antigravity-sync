@@ -106,6 +106,43 @@ function listSyncRepos() {
     }
 }
 
+/**
+ * Auto-create and configure a private sync repo if none exists.
+ * Called automatically before push/pull so the user never has to set up manually.
+ * Repo name: {username}/antigravity-sync-data (PRIVATE)
+ */
+function ensureRepo(state) {
+    if (state.githubRepo) return state.githubRepo;
+
+    if (!isGhCliAvailable()) {
+        throw new Error('GitHub CLI not authenticated. Run: gh auth login');
+    }
+
+    const user = getGhUsername();
+    if (!user) throw new Error('Could not determine GitHub username.');
+
+    const repoName = `${user}/antigravity-sync-data`;
+
+    // Create repo (idempotent — succeeds if already exists)
+    try {
+        shell(
+            `gh repo create ${repoName} --private --description "Antigravity Sync Data (auto-created)" 2>&1`,
+            { timeout: 30000 }
+        );
+    } catch (e) {
+        const msg = [e.stdout, e.stderr].filter(Boolean).join(' ');
+        if (!msg.includes('already exists')) {
+            throw new Error(`Failed to create repo: ${msg || e.message}`);
+        }
+    }
+
+    // Persist to state
+    state.githubRepo = repoName;
+    syncState.saveState(state);
+    console.log(`[AG Sync] Auto-created private repo: ${repoName}`);
+    return repoName;
+}
+
 // ── Git operations ───────────────────────────────────────────────────────────
 
 function prepareLocalRepo(repoUrl) {
@@ -127,9 +164,9 @@ function prepareLocalRepo(repoUrl) {
 }
 
 async function pushToGithub(state, categorySelections, progress) {
-    if (!state.githubRepo) {
-        throw new Error('No GitHub repo configured. Run "AG Sync: Select/Create Sync Repo" first.');
-    }
+    // Auto-create repo if none configured
+    progress?.report({ message: 'Checking repo...', increment: 2 });
+    ensureRepo(state);
 
     const repoUrl = `https://github.com/${state.githubRepo}.git`;
 
@@ -243,7 +280,9 @@ async function pushToGithub(state, categorySelections, progress) {
 }
 
 async function pullFromGithub(state, categorySelections, conflictMode, progress) {
-    if (!state.githubRepo) throw new Error('No GitHub repo configured.');
+    // Auto-create repo if none configured
+    progress?.report({ message: 'Checking repo...', increment: 2 });
+    ensureRepo(state);
 
     const repoUrl = `https://github.com/${state.githubRepo}.git`;
 
@@ -364,4 +403,4 @@ function countFiles(dir) {
     return count;
 }
 
-module.exports = { storeToken, getToken, deleteToken, isGhCliAvailable, getGhUsername, createSyncRepo, listSyncRepos, pushToGithub, pullFromGithub };
+module.exports = { storeToken, getToken, deleteToken, isGhCliAvailable, getGhUsername, createSyncRepo, listSyncRepos, ensureRepo, pushToGithub, pullFromGithub };
