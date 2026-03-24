@@ -216,8 +216,9 @@ function copyDirTracked(src, dst, tracker) {
                     fs.copyFileSync(s, d);
                     tracker.copied++;
                     if (tracker.copied % 100 === 0) {
+                        const pct = tracker.total > 0 ? Math.round((tracker.copied / tracker.total) * 100) : 0;
                         tracker.progress?.report({
-                            message: `[3/7] Copying files: ${tracker.copied.toLocaleString()} copied (${elapsed(tracker.startMs)})`,
+                            message: `[3/7] Copying files: ${tracker.copied.toLocaleString()}/${tracker.total.toLocaleString()} (${pct}%, ${elapsed(tracker.startMs)})`,
                             increment: 1
                         });
                     }
@@ -269,17 +270,20 @@ async function pushToGithub(state, categorySelections, progress) {
         progress?.report({ message: `[1/7] Repo ready. (${elapsed(t0)})`, increment: 2 });
 
         // Phase 2: Count files for progress estimation
-        progress?.report({ message: `[2/7] Estimating file count... (${elapsed(t0)})`, increment: 1 });
+        progress?.report({ message: `[2/7] Counting files... (${elapsed(t0)})`, increment: 1 });
         const selectedCats = Object.keys(categorySelections).filter(id => categorySelections[id]);
         let estimatedTotal = 0;
         for (const catId of selectedCats) {
             const catDef = scanner.CATEGORIES[catId];
             if (!catDef) continue;
-            estimatedTotal += quickCountFiles(catDef.dirs || [], scanner.AG_ROOT);
-            estimatedTotal += (catDef.files || []).length;
-            estimatedTotal += (catDef.parentFiles || []).length;
+            for (const dir of (catDef.dirs || [])) {
+                const p = path.join(scanner.AG_ROOT, dir);
+                if (fs.existsSync(p)) estimatedTotal += countFiles(p);
+            }
+            estimatedTotal += (catDef.files || []).filter(f => fs.existsSync(path.join(scanner.AG_ROOT, f))).length;
+            estimatedTotal += (catDef.parentFiles || []).filter(f => fs.existsSync(path.join(scanner.GEMINI_ROOT, f))).length;
         }
-        progress?.report({ message: `[2/7] ~${estimatedTotal.toLocaleString()} files to stage. (${elapsed(t0)})`, increment: 2 });
+        progress?.report({ message: `[2/7] ${estimatedTotal.toLocaleString()} files to stage. (${elapsed(t0)})`, increment: 2 });
 
         // Phase 3: Copy files with tracking
         const stagingAG = path.join(syncDir, 'antigravity');
