@@ -238,7 +238,6 @@ function activate(context) {
         try {
             const state = syncState.loadState();
 
-            // Use saved selections or default (ensureRepo auto-creates repo)
             let selections = state.categorySelections;
             if (!selections) {
                 const excludes = vscode.workspace.getConfiguration('agSync').get('excludeCategories', []);
@@ -246,19 +245,38 @@ function activate(context) {
             }
 
             updateStatusBar('pushing');
+            dashboard.sendOperationStatus('pushing');
+            dashboard.sendLog('step', 'Starting push to GitHub...');
+            dashboard.sendProgress(0, 'Initializing...');
+
             const result = await vscode.window.withProgress({
                 location: vscode.ProgressLocation.Notification,
                 title: 'AG Sync: Pushing to GitHub...',
                 cancellable: false
             }, async (progress) => {
-                return await github.pushToGithub(state, selections, progress);
+                // Wrap progress to also feed dashboard
+                const dualProgress = {
+                    report: (msg) => {
+                        progress.report(msg);
+                        if (msg.message) dashboard.sendLog('info', msg.message);
+                        if (msg.increment) dashboard.sendProgress(Math.min(95, (msg.increment || 0) * 2), msg.message || '');
+                    }
+                };
+                return await github.pushToGithub(state, selections, dualProgress);
             });
 
             updateStatusBar('idle');
+            dashboard.sendProgress(100, 'Push complete!');
+            dashboard.sendOperationStatus('success');
+            dashboard.sendLog('success', `Push complete: ${result.message} (${result.filesCount} files)`);
+            if (result.commit) dashboard.sendLog('info', `Commit: ${result.commit.slice(0, 7)}`);
             vscode.window.showInformationMessage(`Push complete: ${result.message}`);
             dashboard.refresh(context);
         } catch (e) {
             updateStatusBar('error');
+            dashboard.sendOperationStatus('error');
+            dashboard.sendLog('error', `Push failed: ${e.message}`);
+            dashboard.sendProgress(0, 'Failed');
             vscode.window.showErrorMessage(`Push failed: ${e.message}`);
         }
     }));
@@ -268,7 +286,6 @@ function activate(context) {
         try {
             const state = syncState.loadState();
 
-            // Default to newer-wins for smart multi-machine merge
             const conflictMode = vscode.workspace.getConfiguration('agSync').get('conflictResolution', 'newer-wins');
             let resolvedMode = conflictMode;
 
@@ -292,21 +309,39 @@ function activate(context) {
             }
 
             updateStatusBar('pulling');
+            dashboard.sendOperationStatus('pulling');
+            dashboard.sendLog('step', `Starting pull from GitHub (mode: ${resolvedMode})...`);
+            dashboard.sendProgress(0, 'Initializing...');
+
             const result = await vscode.window.withProgress({
                 location: vscode.ProgressLocation.Notification,
                 title: 'AG Sync: Pulling from GitHub...',
                 cancellable: false
             }, async (progress) => {
-                return await github.pullFromGithub(state, selections, resolvedMode, progress);
+                const dualProgress = {
+                    report: (msg) => {
+                        progress.report(msg);
+                        if (msg.message) dashboard.sendLog('info', msg.message);
+                        if (msg.increment) dashboard.sendProgress(Math.min(95, (msg.increment || 0) * 2), msg.message || '');
+                    }
+                };
+                return await github.pullFromGithub(state, selections, resolvedMode, dualProgress);
             });
 
             updateStatusBar('idle');
+            dashboard.sendProgress(100, 'Pull complete!');
+            dashboard.sendOperationStatus('success');
+            dashboard.sendLog('success', `Pull complete: ${result.filesImported} imported, ${result.filesSkipped} skipped`);
+            if (result.commit) dashboard.sendLog('info', `Commit: ${result.commit.slice(0, 7)}`);
             vscode.window.showInformationMessage(
                 `Pull complete: ${result.filesImported} imported, ${result.filesSkipped} skipped.`
             );
             dashboard.refresh(context);
         } catch (e) {
             updateStatusBar('error');
+            dashboard.sendOperationStatus('error');
+            dashboard.sendLog('error', `Pull failed: ${e.message}`);
+            dashboard.sendProgress(0, 'Failed');
             vscode.window.showErrorMessage(`Pull failed: ${e.message}`);
         }
     }));
