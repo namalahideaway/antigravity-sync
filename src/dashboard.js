@@ -252,7 +252,7 @@ body { font-family:'Segoe UI',system-ui,sans-serif; background:var(--bg); color:
 
 /* ── Activity Log (right panel) ─────────────────────────────── */
 .log-header { padding:14px 16px; border-bottom:1px solid var(--border); font-size:13px; font-weight:700; color:var(--bright); text-transform:uppercase; letter-spacing:.5px; display:flex; align-items:center; gap:8px; }
-.log-body { flex:1; overflow-y:auto; padding:8px; font-family:'Cascadia Code','SF Mono','Fira Code',monospace; font-size:11px; line-height:1.7; }
+.log-body { flex:1; overflow-y:auto; padding:8px; font-family:'Cascadia Code','SF Mono','Fira Code',monospace; font-size:11px; line-height:1.7; max-height:calc(100vh - 130px); }
 .log-entry { padding:2px 8px; border-radius:4px; }
 .log-entry:hover { background:rgba(255,255,255,.03); }
 .log-entry .time { color:var(--dim); margin-right:6px; }
@@ -382,10 +382,9 @@ function addLog(level, message, ts) {
     const el = document.createElement('div');
     el.className = 'log-entry ' + level;
     el.innerHTML = '<span class="time">' + time + '</span><span class="msg">' + esc(message) + '</span>';
-    logBody.appendChild(el);
-    logBody.scrollTop = logBody.scrollHeight;
+    logBody.prepend(el);
     logCount++;
-    if (logCount > 200) { logBody.removeChild(logBody.firstChild); logCount--; }
+    if (logCount > 200) { logBody.removeChild(logBody.lastChild); logCount--; }
 }
 
 window.addEventListener('message', e => {
