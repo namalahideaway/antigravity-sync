@@ -1,0 +1,4 @@
+{
+    "**/*.vsix": true,
+    "node_modules": true
+}

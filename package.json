@@ -1,0 +1,172 @@
+{
+    "name": "antigravity-sync",
+    "displayName": "Antigravity Sync",
+    "description": "Export, import, and sync all Antigravity IDE data (chats, brain, knowledge, projects, config) between computers via GitHub.",
+    "version": "1.0.0",
+    "publisher": "TureAutoAcceptAntiGravity",
+    "engines": {
+        "vscode": "^1.60.0"
+    },
+    "activationEvents": [
+        "onStartupFinished"
+    ],
+    "main": "./extension.js",
+    "categories": [
+        "Other"
+    ],
+    "keywords": [
+        "antigravity",
+        "sync",
+        "backup",
+        "export",
+        "import",
+        "github",
+        "migration"
+    ],
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/namalahideaway/antigravity-sync"
+    },
+    "contributes": {
+        "commands": [
+            {
+                "command": "agSync.export",
+                "title": "AG Sync: Export Data to ZIP"
+            },
+            {
+                "command": "agSync.import",
+                "title": "AG Sync: Import Data from ZIP"
+            },
+            {
+                "command": "agSync.dashboard",
+                "title": "AG Sync: Open Dashboard"
+            },
+            {
+                "command": "agSync.githubLogin",
+                "title": "AG Sync: Connect GitHub Account"
+            },
+            {
+                "command": "agSync.githubLogout",
+                "title": "AG Sync: Disconnect GitHub"
+            },
+            {
+                "command": "agSync.githubSelectRepo",
+                "title": "AG Sync: Select/Create Sync Repo"
+            },
+            {
+                "command": "agSync.push",
+                "title": "AG Sync: Push to GitHub"
+            },
+            {
+                "command": "agSync.pull",
+                "title": "AG Sync: Pull from GitHub"
+            },
+            {
+                "command": "agSync.fullSync",
+                "title": "AG Sync: Full Sync (Push + Pull)"
+            },
+            {
+                "command": "agSync.status",
+                "title": "AG Sync: Show Sync Status"
+            },
+            {
+                "command": "agSync.selectCategories",
+                "title": "AG Sync: Select Categories to Sync"
+            },
+            {
+                "command": "agSync.viewDiff",
+                "title": "AG Sync: View Changes Since Last Sync"
+            },
+            {
+                "command": "agSync.resetSync",
+                "title": "AG Sync: Reset Sync State"
+            },
+            {
+                "command": "agSync.scanData",
+                "title": "AG Sync: Scan Antigravity Data"
+            },
+            {
+                "command": "agSync.autoSyncToggle",
+                "title": "AG Sync: Toggle Auto-Sync"
+            }
+        ],
+        "keybindings": [
+            {
+                "command": "agSync.dashboard",
+                "key": "ctrl+alt+shift+s",
+                "mac": "cmd+alt+shift+s"
+            },
+            {
+                "command": "agSync.push",
+                "key": "ctrl+alt+shift+p",
+                "mac": "cmd+alt+shift+p"
+            },
+            {
+                "command": "agSync.export",
+                "key": "ctrl+alt+shift+e",
+                "mac": "cmd+alt+shift+e"
+            }
+        ],
+        "configuration": {
+            "title": "Antigravity Sync",
+            "properties": {
+                "agSync.defaultExportPath": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Default directory for exports. Empty = Desktop."
+                },
+                "agSync.excludeCategories": {
+                    "type": "array",
+                    "default": [
+                        "recordings"
+                    ],
+                    "items": {
+                        "type": "string"
+                    },
+                    "description": "Categories to exclude by default (recordings, scratch, playground, etc.)"
+                },
+                "agSync.conflictResolution": {
+                    "type": "string",
+                    "enum": [
+                        "ask",
+                        "local-wins",
+                        "remote-wins",
+                        "newer-wins"
+                    ],
+                    "default": "ask",
+                    "description": "How to resolve sync conflicts."
+                },
+                "agSync.autoSync": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "Enable automatic sync on startup and periodically."
+                },
+                "agSync.autoSyncIntervalMinutes": {
+                    "type": "number",
+                    "default": 30,
+                    "minimum": 5,
+                    "maximum": 1440,
+                    "description": "Auto-sync interval in minutes."
+                },
+                "agSync.maxFileSizeMB": {
+                    "type": "number",
+                    "default": 100,
+                    "minimum": 1,
+                    "maximum": 2000,
+                    "description": "Max individual file size for sync (MB). Larger files are skipped."
+                },
+                "agSync.compressionLevel": {
+                    "type": "string",
+                    "enum": [
+                        "fast",
+                        "balanced",
+                        "maximum"
+                    ],
+                    "default": "balanced",
+                    "description": "ZIP compression level for exports."
+                }
+            }
+        }
+    }
+}
