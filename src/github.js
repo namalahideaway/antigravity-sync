@@ -30,12 +30,28 @@ function gitCmd(command, extraOpts = {}) {
 
 // Initialize or verify the persistent git repo
 function ensurePersistentRepo(repoUrl) {
-    if (!fs.existsSync(PERSISTENT_GIT_DIR)) {
+    const headPath = path.join(PERSISTENT_GIT_DIR, 'HEAD');
+
+    if (!fs.existsSync(headPath)) {
+        // Directory might exist but be corrupt (no HEAD) — wipe and reinit
+        if (fs.existsSync(PERSISTENT_GIT_DIR)) {
+            try { fs.rmSync(PERSISTENT_GIT_DIR, { recursive: true, force: true }); } catch (e) { }
+        }
         fs.mkdirSync(PERSISTENT_GIT_DIR, { recursive: true });
-        gitCmd('init --bare');
+
+        // Init WITHOUT --bare and WITHOUT GIT_WORK_TREE to avoid conflict
+        const initEnv = { ...process.env, GIT_DIR: PERSISTENT_GIT_DIR };
+        execSync(`cmd /c git init`, {
+            encoding: 'utf8', windowsHide: true, timeout: 30000, env: initEnv
+        });
+
+        // Ensure bare=false so GIT_WORK_TREE operations work
+        gitCmd('config core.bare false');
         gitCmd(`remote add origin "${repoUrl}"`);
+        console.log(`[AG Sync] Initialized persistent repo at ${PERSISTENT_GIT_DIR}`);
     } else {
-        // Ensure remote is correct
+        // Existing valid repo — ensure bare is off and remote is correct
+        try { gitCmd('config core.bare false'); } catch (e) { }
         try {
             const current = gitCmd('remote get-url origin').trim();
             if (current !== repoUrl) {
@@ -289,13 +305,21 @@ async function pushToGithub(state, categorySelections, progress) {
         for (const dir of (catDef.dirs || [])) {
             const dirPath = path.join(scanner.AG_ROOT, dir);
             if (fs.existsSync(dirPath)) {
-                try { gitCmd(`add -f -- "${dir}"`, { timeout: 300000 }); } catch (e) { }
+                try {
+                    gitCmd(`add -f -- "${dir}"`, { timeout: 300000 });
+                } catch (e) {
+                    console.warn(`[AG Sync] git add failed for ${dir}: ${e.message}`);
+                }
             }
         }
         for (const file of (catDef.files || [])) {
             const filePath = path.join(scanner.AG_ROOT, file);
             if (fs.existsSync(filePath)) {
-                try { gitCmd(`add -f -- "${file}"`, { timeout: 30000 }); } catch (e) { }
+                try {
+                    gitCmd(`add -f -- "${file}"`, { timeout: 30000 });
+                } catch (e) {
+                    console.warn(`[AG Sync] git add failed for ${file}: ${e.message}`);
+                }
             }
         }
     }
