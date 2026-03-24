@@ -398,11 +398,18 @@ window.addEventListener('message', e => {
 function updateProgress(pct, msg) {
     const card = document.getElementById('progressCard');
     card.style.display = 'block';
-    document.getElementById('progressBar').style.width = pct + '%';
-    document.getElementById('progressPct').textContent = pct + '%';
+    // Auto-parse percentage from message if pct not given
+    let percent = pct;
+    if ((!percent || percent <= 0) && msg) {
+        const m = msg.match(/\((\d+)%\)/);
+        if (m) percent = parseInt(m[1]);
+    }
+    percent = percent || 0;
+    document.getElementById('progressBar').style.width = percent + '%';
+    document.getElementById('progressPct').textContent = percent + '%';
     document.getElementById('progressMsg').textContent = msg || '';
-    if (pct >= 100) {
-        setTimeout(() => { card.style.display = 'none'; }, 3000);
+    if (percent >= 100) {
+        setTimeout(() => { card.style.display = 'none'; }, 5000);
     }
 }
 
@@ -462,14 +469,21 @@ function render(d) {
     // History
     const hl = document.getElementById('histList');
     if (d.state.syncHistory && d.state.syncHistory.length > 0) {
-        hl.innerHTML = d.state.syncHistory.slice(0, 20).map(h =>
-            '<div class="hist-item">' +
-            '<span class="hist-badge ' + h.action + '">' + h.action + '</span>' +
-            '<span class="hist-time">' + fmtTime(h.timestamp) + '</span>' +
-            '<span class="hist-files">' + (h.filesCount || h.filesImported || 0) + ' files</span>' +
-            (h.commit ? '<span class="hist-sha">' + h.commit.slice(0,7) + '</span>' : '') +
-            '</div>'
-        ).join('');
+        hl.innerHTML = d.state.syncHistory.slice(0, 20).map(h => {
+            let detail = '';
+            if (h.added !== undefined) {
+                detail = '+' + h.added + ' ~' + h.modified + ' -' + h.deleted;
+                if (h.unchanged) detail += ' (' + h.unchanged.toLocaleString() + ' ok)';
+            } else {
+                detail = (h.filesCount || h.filesImported || 0) + ' files';
+            }
+            return '<div class="hist-item">' +
+                '<span class="hist-badge ' + h.action + '">' + h.action + '</span>' +
+                '<span class="hist-time">' + fmtTime(h.timestamp) + '</span>' +
+                '<span class="hist-files">' + detail + '</span>' +
+                (h.commit ? '<span class="hist-sha">' + h.commit.slice(0,7) + '</span>' : '') +
+                '</div>';
+        }).join('');
     } else {
         hl.innerHTML = '<p class="empty">No sync history yet. Hit Push to start.</p>';
     }
@@ -488,7 +502,7 @@ function fmtTime(iso) {
 }
 
 post('refresh');
-addLog('info', 'AG Sync Dashboard v1.2 loaded');
+addLog('info', 'AG Sync Dashboard v2.0 loaded');
 </script>
 </body>
 </html>`;

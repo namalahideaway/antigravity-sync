@@ -28,6 +28,19 @@ function gitCmd(command, extraOpts = {}) {
     return execSync(`cmd /c git ${command}`, { ...defaults, ...extraOpts });
 }
 
+// ── Stale lockfile cleanup ──────────────────────────────────────────────────
+function clearStaleLocks() {
+    const lockFile = path.join(PERSISTENT_GIT_DIR, 'index.lock');
+    if (fs.existsSync(lockFile)) {
+        try {
+            fs.unlinkSync(lockFile);
+            console.log('[AG Sync] Removed stale index.lock');
+        } catch (e) {
+            console.warn('[AG Sync] Could not remove index.lock:', e.message);
+        }
+    }
+}
+
 // Initialize or verify the persistent git repo
 function ensurePersistentRepo(repoUrl) {
     const headPath = path.join(PERSISTENT_GIT_DIR, 'HEAD');
@@ -39,13 +52,12 @@ function ensurePersistentRepo(repoUrl) {
         }
         fs.mkdirSync(PERSISTENT_GIT_DIR, { recursive: true });
 
-        // Init WITHOUT --bare and WITHOUT GIT_WORK_TREE to avoid conflict
+        // Init WITHOUT --bare
         const initEnv = { ...process.env, GIT_DIR: PERSISTENT_GIT_DIR };
         execSync(`cmd /c git init`, {
             encoding: 'utf8', windowsHide: true, timeout: 30000, env: initEnv
         });
 
-        // Ensure bare=false so GIT_WORK_TREE operations work
         gitCmd('config core.bare false');
         gitCmd(`remote add origin "${repoUrl}"`);
         console.log(`[AG Sync] Initialized persistent repo at ${PERSISTENT_GIT_DIR}`);
@@ -61,6 +73,9 @@ function ensurePersistentRepo(repoUrl) {
             try { gitCmd(`remote add origin "${repoUrl}"`); } catch (e2) { }
         }
     }
+
+    // Always clear stale locks after init/verify
+    clearStaleLocks();
 }
 
 // Safe cleanup with retry for Windows file locks
@@ -76,12 +91,6 @@ function safeCleanup(dir) {
             }
         }
     }
-}
-
-// ── Shell helper — ALL commands go through cmd /c ────────────────────────────
-function shell(command, opts = {}) {
-    const defaults = { encoding: 'utf8', windowsHide: true, timeout: 15000 };
-    return execSync(`cmd /c ${command}`, { ...defaults, ...opts });
 }
 
 // ── Token management ─────────────────────────────────────────────────────────
@@ -105,8 +114,6 @@ function isGhCliAvailable() {
         const result = shell('gh auth status 2>&1', { timeout: 8000 });
         return result.includes('Logged in');
     } catch (e) {
-        // execSync throws on non-zero exit, but gh auth status may still
-        // output "Logged in" on stderr captured by 2>&1
         try {
             if (e.stdout && e.stdout.includes('Logged in')) return true;
             if (e.stderr && e.stderr.includes('Logged in')) return true;
@@ -114,7 +121,7 @@ function isGhCliAvailable() {
                 const combined = e.output.map(b => b ? b.toString() : '').join('');
                 if (combined.includes('Logged in')) return true;
             }
-        } catch (e2) { /* give up */ }
+        } catch (e2) { }
         return false;
     }
 }
@@ -125,7 +132,6 @@ function getGhUsername() {
         const match = result.match(/account\s+(\S+)/);
         return match ? match[1] : null;
     } catch (e) {
-        // Same pattern — check stderr/stdout for account info
         try {
             const combined = [e.stdout, e.stderr, ...(e.output || [])].filter(Boolean).join(' ');
             const match = combined.match(/account\s+(\S+)/);
@@ -164,8 +170,6 @@ function listSyncRepos() {
 
 /**
  * Auto-create and configure a private sync repo if none exists.
- * Called automatically before push/pull so the user never has to set up manually.
- * Repo name: {username}/antigravity-sync-data (PRIVATE)
  */
 function ensureRepo(state) {
     if (state.githubRepo) return state.githubRepo;
@@ -179,7 +183,6 @@ function ensureRepo(state) {
 
     const repoName = `${user}/antigravity-sync-data`;
 
-    // Create repo (idempotent — succeeds if already exists)
     try {
         shell(
             `gh repo create ${repoName} --private --description "Antigravity Sync Data (auto-created)" 2>&1`,
@@ -192,11 +195,38 @@ function ensureRepo(state) {
         }
     }
 
-    // Persist to state
     state.githubRepo = repoName;
     syncState.saveState(state);
     console.log(`[AG Sync] Auto-created private repo: ${repoName}`);
     return repoName;
+}
+
+// ── Elapsed time + ETA helpers ──────────────────────────────────────────────
+
+function elapsed(startMs) {
+    const s = Math.floor((Date.now() - startMs) / 1000);
+    if (s < 60) return `${s}s`;
+    return `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+function eta(startMs, done, total) {
+    if (done <= 0 || total <= 0) return '';
+    const elapsedMs = Date.now() - startMs;
+    const rate = done / elapsedMs;
+    const remainMs = (total - done) / rate;
+    const s = Math.ceil(remainMs / 1000);
+    if (s < 60) return `~${s}s left`;
+    return `~${Math.floor(s / 60)}m ${s % 60}s left`;
+}
+
+function pct(done, total) {
+    if (total <= 0) return '0%';
+    return Math.min(100, Math.round((done / total) * 100)) + '%';
+}
+
+// ── Only skip .git dirs ─────────────────────────────────────────────────────
+function shouldSkip(name) {
+    return name === '.git';
 }
 
 // ── Git operations ───────────────────────────────────────────────────────────
@@ -216,152 +246,133 @@ function prepareLocalRepo(repoUrl, syncDir, progress) {
     }
 }
 
-// ── Elapsed time helper ─────────────────────────────────────────────────────
-function elapsed(startMs) {
-    const s = Math.floor((Date.now() - startMs) / 1000);
-    if (s < 60) return `${s}s`;
-    return `${Math.floor(s / 60)}m ${s % 60}s`;
-}
-
-// ── Only skip .git dirs (would conflict with sync repo's own git) ────────────
-function shouldSkip(name) {
-    return name === '.git';
-}
-
-// ── Tracked copy: reports progress every N files ────────────────────────────
-function copyDirTracked(src, dst, tracker) {
-    fs.mkdirSync(dst, { recursive: true });
-    try {
-        for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
-            if (shouldSkip(entry.name)) continue;
-            const s = path.join(src, entry.name), d = path.join(dst, entry.name);
-            try {
-                if (entry.isDirectory()) {
-                    copyDirTracked(s, d, tracker);
-                } else {
-                    fs.copyFileSync(s, d);
-                    tracker.copied++;
-                    if (tracker.copied % 100 === 0) {
-                        const pct = tracker.total > 0 ? Math.round((tracker.copied / tracker.total) * 100) : 0;
-                        tracker.progress?.report({
-                            message: `[3/7] Copying files: ${tracker.copied.toLocaleString()}/${tracker.total.toLocaleString()} (${pct}%, ${elapsed(tracker.startMs)})`,
-                            increment: 1
-                        });
-                    }
-                }
-            } catch (e) { /* skip unreadable */ }
-        }
-    } catch (e) { }
-}
-
-// ── Quick file count (non-recursive, top-level only for speed) ──────────────
-function quickCountFiles(dirs, baseDir) {
-    let total = 0;
-    for (const dir of dirs) {
-        const p = path.join(baseDir, dir);
-        try {
-            const entries = fs.readdirSync(p, { withFileTypes: true });
-            for (const e of entries) {
-                if (e.isDirectory()) {
-                    // Only go 1 level deep for estimation
-                    try { total += fs.readdirSync(path.join(p, e.name)).length; } catch (e2) { total += 10; }
-                } else {
-                    total++;
-                }
-            }
-        } catch (e) { }
-    }
-    return total;
-}
+// ═════════════════════════════════════════════════════════════════════════════
+// PUSH v2.0 — Checksum-based selective staging with real % progress
+// ═════════════════════════════════════════════════════════════════════════════
 
 async function pushToGithub(state, categorySelections, progress) {
     const t0 = Date.now();
 
-    // Phase 0: Ensure repo
-    progress?.report({ message: `[0/4] Checking repo config... (${elapsed(t0)})`, increment: 2 });
+    // ── Phase 0: Ensure repo config ──────────────────────────────────────
+    progress?.report({ message: `[1/5] Checking repo config...`, increment: 2 });
     ensureRepo(state);
-    progress?.report({ message: `[0/4] Repo: ${state.githubRepo} (${elapsed(t0)})`, increment: 3 });
+    progress?.report({ message: `[1/5] Repo: ${state.githubRepo}`, increment: 3 });
 
     const repoUrl = `https://github.com/${state.githubRepo}.git`;
 
-    // Phase 1: Ensure persistent git repo
-    progress?.report({ message: `[1/4] Setting up persistent repo... (${elapsed(t0)})`, increment: 5 });
+    // ── Phase 1: Setup persistent git repo + clear stale locks ───────────
+    progress?.report({ message: `[1/5] Setting up git repo...`, increment: 2 });
     ensurePersistentRepo(repoUrl);
-    progress?.report({ message: `[1/4] Repo ready. (${elapsed(t0)})`, increment: 5 });
+    progress?.report({ message: `[1/5] Git repo ready (${elapsed(t0)})`, increment: 3 });
 
-    const selectedCats = Object.keys(categorySelections).filter(id => categorySelections[id]);
+    // ── Phase 2: Checksum scan — detect what actually changed ────────────
+    progress?.report({ message: `[2/5] Scanning files for changes...`, increment: 2 });
 
-    // Phase 2: Stage selected files (git reads directly from source — no copies)
-    progress?.report({ message: `[2/4] Staging files... (${elapsed(t0)})`, increment: 5 });
+    const scanResult = syncState.detectChangedFiles(state, categorySelections, (scanned, total, currentFile) => {
+        progress?.report({
+            message: `[2/5] Scanning: ${scanned.toLocaleString()}/${total.toLocaleString()} (${pct(scanned, total)}) ${eta(t0, scanned, total)}`
+        });
+    });
 
-    // Reset index to start fresh staging
-    try { gitCmd('rm -r --cached . 2>&1', { timeout: 300000 }); } catch (e) { }
+    const { toAdd, toUpdate, toRemove, unchanged, currentHashes, totalFiles, changedCount } = scanResult;
 
-    for (const catId of selectedCats) {
-        const catDef = scanner.CATEGORIES[catId];
-        if (!catDef) continue;
-        progress?.report({ message: `[2/4] Adding ${catDef.label}... (${elapsed(t0)})` });
+    progress?.report({
+        message: `[2/5] Scan done: ${changedCount.toLocaleString()} changed, ${unchanged.length.toLocaleString()} unchanged (${elapsed(t0)})`,
+        increment: 8
+    });
 
-        for (const dir of (catDef.dirs || [])) {
-            const dirPath = path.join(scanner.AG_ROOT, dir);
-            if (fs.existsSync(dirPath)) {
-                try {
-                    gitCmd(`add -f -- "${dir}"`, { timeout: 300000 });
-                } catch (e) {
-                    console.warn(`[AG Sync] git add failed for ${dir}: ${e.message}`);
+    // If nothing changed, skip everything
+    if (changedCount === 0) {
+        progress?.report({ message: `No changes detected. All ${totalFiles.toLocaleString()} files match checksums.`, increment: 80 });
+        return { success: true, message: `No changes to push. ${totalFiles.toLocaleString()} files verified.`, filesCount: 0 };
+    }
+
+    // ── Phase 3: Selective staging — only add changed/new, rm deleted ────
+    const filesToStage = [...toAdd, ...toUpdate];
+    const totalStages = filesToStage.length + toRemove.length;
+    let staged = 0;
+
+    progress?.report({
+        message: `[3/5] Staging ${totalStages.toLocaleString()} changed files...`,
+        increment: 2
+    });
+
+    // Clear stale locks before staging
+    clearStaleLocks();
+
+    // Stage changed/new files in batches (git add up to 50 paths at a time)
+    const BATCH_SIZE = 50;
+    for (let i = 0; i < filesToStage.length; i += BATCH_SIZE) {
+        const batch = filesToStage.slice(i, i + BATCH_SIZE);
+        const quotedPaths = batch.map(p => `"${p}"`).join(' ');
+        try {
+            gitCmd(`add -f -- ${quotedPaths}`, { timeout: 300000 });
+        } catch (e) {
+            // Fallback: add one by one
+            for (const p of batch) {
+                try { gitCmd(`add -f -- "${p}"`, { timeout: 30000 }); } catch (e2) {
+                    console.warn(`[AG Sync] git add failed for ${p}: ${e2.message}`);
                 }
             }
         }
-        for (const file of (catDef.files || [])) {
-            const filePath = path.join(scanner.AG_ROOT, file);
-            if (fs.existsSync(filePath)) {
-                try {
-                    gitCmd(`add -f -- "${file}"`, { timeout: 30000 });
-                } catch (e) {
-                    console.warn(`[AG Sync] git add failed for ${file}: ${e.message}`);
-                }
-            }
+        staged += batch.length;
+        if (staged % BATCH_SIZE === 0 || staged === filesToStage.length) {
+            progress?.report({
+                message: `[3/5] Staging: ${staged.toLocaleString()}/${totalStages.toLocaleString()} (${pct(staged, totalStages)}) ${eta(t0, staged, totalStages)}`
+            });
         }
     }
-    progress?.report({ message: `[2/4] Files staged. (${elapsed(t0)})`, increment: 10 });
 
-    // Check for changes
-    let hasChanges = true;
-    try {
-        const status = gitCmd('status --porcelain').trim();
-        if (!status) hasChanges = false;
-    } catch (e) { }
-
-    if (!hasChanges) {
-        progress?.report({ message: `[2/4] No changes detected. (${elapsed(t0)})`, increment: 50 });
-        return { success: true, message: 'No changes to push.', filesCount: 0 };
+    // Remove deleted files
+    if (toRemove.length > 0) {
+        for (let i = 0; i < toRemove.length; i += BATCH_SIZE) {
+            const batch = toRemove.slice(i, i + BATCH_SIZE);
+            const quotedPaths = batch.map(p => `"${p}"`).join(' ');
+            try { gitCmd(`rm --cached --ignore-unmatch -- ${quotedPaths}`, { timeout: 60000 }); } catch (e) { }
+            staged += batch.length;
+        }
+        progress?.report({
+            message: `[3/5] Removed ${toRemove.length.toLocaleString()} deleted files from index`
+        });
     }
 
-    // Commit
-    const commitMsg = `AG Sync: ${new Date().toISOString()} from ${os.hostname()}`;
-    progress?.report({ message: `[2/4] Committing... (${elapsed(t0)})`, increment: 5 });
+    progress?.report({
+        message: `[3/5] Staged: +${toAdd.length.toLocaleString()} new, ~${toUpdate.length.toLocaleString()} modified, -${toRemove.length.toLocaleString()} deleted (${elapsed(t0)})`,
+        increment: 10
+    });
+
+    // ── Commit ───────────────────────────────────────────────────────────
+    const commitMsg = `AG Sync: ${new Date().toISOString()} from ${os.hostname()} [+${toAdd.length} ~${toUpdate.length} -${toRemove.length}]`;
+    progress?.report({ message: `[3/5] Committing ${changedCount.toLocaleString()} changes...`, increment: 5 });
+
+    // Clear locks before commit too
+    clearStaleLocks();
+
     try {
         gitCmd(`commit -m "${commitMsg}"`, { timeout: 300000 });
     } catch (e) {
         const msg = [e.stdout, e.stderr].filter(Boolean).join(' ');
-        if (msg.includes('nothing to commit')) return { success: true, message: 'Already up to date.', filesCount: 0 };
-        throw e;
+        if (msg.includes('nothing to commit')) {
+            return { success: true, message: 'Already up to date (git sees no diff).', filesCount: 0 };
+        }
+        // If index.lock error, try clearing and retrying once
+        if (msg.includes('index.lock')) {
+            clearStaleLocks();
+            try {
+                gitCmd(`commit -m "${commitMsg}"`, { timeout: 300000 });
+            } catch (e2) {
+                throw new Error(`Commit failed after lock cleanup: ${e2.message}`);
+            }
+        } else {
+            throw e;
+        }
     }
 
-    // Count committed files
-    let totalFiles = 0;
-    try {
-        const ls = gitCmd('diff --name-only HEAD~1..HEAD 2>&1').trim();
-        totalFiles = ls ? ls.split('\n').length : 0;
-    } catch (e) {
-        try {
-            const ls = gitCmd('ls-tree -r --name-only HEAD').trim();
-            totalFiles = ls ? ls.split('\n').length : 0;
-        } catch (e2) { }
-    }
-
-    // Phase 3: Push
-    progress?.report({ message: `[3/4] Pushing ${totalFiles.toLocaleString()} files to GitHub... (${elapsed(t0)})`, increment: 10 });
+    // ── Phase 4: Push ────────────────────────────────────────────────────
+    progress?.report({
+        message: `[4/5] Pushing ${changedCount.toLocaleString()} changes to GitHub... (${elapsed(t0)})`,
+        increment: 10
+    });
     try {
         gitCmd('push -u origin main --force 2>&1', { timeout: 600000 });
     } catch (e) {
@@ -371,47 +382,70 @@ async function pushToGithub(state, categorySelections, progress) {
             throw new Error(`Push failed: ${e2.message}`);
         }
     }
-    progress?.report({ message: `[3/4] Push complete. (${elapsed(t0)})`, increment: 10 });
+    progress?.report({ message: `[4/5] Push complete. (${elapsed(t0)})`, increment: 10 });
 
     let commitSha = null;
     try { commitSha = gitCmd('rev-parse HEAD').trim(); } catch (e) { }
 
-    // Phase 4: Finalize
-    progress?.report({ message: `[4/4] Finalizing... (${elapsed(t0)})`, increment: 2 });
+    // ── Phase 5: Finalize — save checksums ───────────────────────────────
+    progress?.report({ message: `[5/5] Saving checksums...`, increment: 2 });
 
     state.lastPushTime = new Date().toISOString();
     state.lastPushCommit = commitSha;
     state.categorySelections = categorySelections;
 
-    const { currentHashes } = syncState.detectChanges(state, categorySelections);
+    // Store the checksums we computed during scan so next push can diff
     syncState.updateSyncHashes(state, currentHashes);
 
+    const selectedCats = Object.keys(categorySelections).filter(id => categorySelections[id]);
     syncState.addHistoryEntry(state, {
-        action: 'push', commit: commitSha, filesCount: totalFiles, categories: selectedCats
+        action: 'push',
+        commit: commitSha,
+        filesCount: changedCount,
+        totalFiles,
+        added: toAdd.length,
+        modified: toUpdate.length,
+        deleted: toRemove.length,
+        unchanged: unchanged.length,
+        categories: selectedCats
     });
 
     const totalTime = elapsed(t0);
-    progress?.report({ message: `Done! ${totalFiles.toLocaleString()} files pushed in ${totalTime}`, increment: 5 });
+    progress?.report({
+        message: `✓ Done! +${toAdd.length} ~${toUpdate.length} -${toRemove.length} pushed (${unchanged.length.toLocaleString()} unchanged) in ${totalTime}`,
+        increment: 5
+    });
 
-    return { success: true, message: `Pushed ${totalFiles.toLocaleString()} files in ${totalTime}.`, filesCount: totalFiles, commit: commitSha };
+    return {
+        success: true,
+        message: `Pushed ${changedCount.toLocaleString()} changes in ${totalTime}. ${unchanged.length.toLocaleString()} files unchanged.`,
+        filesCount: changedCount,
+        totalFiles,
+        added: toAdd.length,
+        modified: toUpdate.length,
+        deleted: toRemove.length,
+        unchanged: unchanged.length,
+        commit: commitSha
+    };
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PULL — unchanged from v1.9 (pull still needs full clone)
+// ═════════════════════════════════════════════════════════════════════════════
 
 async function pullFromGithub(state, categorySelections, conflictMode, progress) {
     const t0 = Date.now();
 
-    // Phase 0: Ensure repo
     progress?.report({ message: `[0/4] Checking repo config... (${elapsed(t0)})`, increment: 2 });
     ensureRepo(state);
     progress?.report({ message: `[0/4] Repo: ${state.githubRepo} (${elapsed(t0)})`, increment: 3 });
 
     const repoUrl = `https://github.com/${state.githubRepo}.git`;
 
-    // Create temp dir for clone (pull does need to download)
     const pullDir = path.join(PULL_TMP_BASE, `pull-${Date.now()}`);
     fs.mkdirSync(pullDir, { recursive: true });
 
     try {
-        // Phase 1: Clone
         progress?.report({ message: `[1/4] Cloning from GitHub... (${elapsed(t0)})`, increment: 5 });
         try {
             shell(`git clone --depth 1 "${repoUrl}" "${pullDir}" 2>&1`, { timeout: 600000 });
@@ -420,11 +454,9 @@ async function pullFromGithub(state, categorySelections, conflictMode, progress)
         }
         progress?.report({ message: `[1/4] Clone complete. (${elapsed(t0)})`, increment: 10 });
 
-        // Phase 2: Merge files into AG data directory
         let filesImported = 0;
         let filesSkipped = 0;
 
-        // The cloned repo has files at top level (same paths as AG_ROOT)
         const entries = fs.readdirSync(pullDir, { withFileTypes: true })
             .filter(e => e.name !== '.git' && e.name !== '_ag_sync_meta.json');
         const totalEntries = entries.length;
@@ -461,7 +493,6 @@ async function pullFromGithub(state, categorySelections, conflictMode, progress)
             }
         }
 
-        // Phase 3: Finalize
         progress?.report({ message: `[3/4] Finalizing... (${elapsed(t0)})`, increment: 5 });
 
         let commitSha = null;
@@ -472,7 +503,6 @@ async function pullFromGithub(state, categorySelections, conflictMode, progress)
 
         syncState.addHistoryEntry(state, { action: 'pull', commit: commitSha, filesImported, filesSkipped });
 
-        // Phase 4: Done
         const totalTime = elapsed(t0);
         progress?.report({ message: `Done! ${filesImported.toLocaleString()} imported, ${filesSkipped} skipped in ${totalTime}`, increment: 5 });
 
