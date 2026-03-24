@@ -269,19 +269,22 @@ async function pushToGithub(state, categorySelections, progress) {
         prepareLocalRepo(repoUrl, syncDir, progress);
         progress?.report({ message: `[1/7] Repo ready. (${elapsed(t0)})`, increment: 2 });
 
-        // Phase 2: Count files for progress estimation
+        // Phase 2: Count files (reports per-category so user sees activity)
         progress?.report({ message: `[2/7] Counting files... (${elapsed(t0)})`, increment: 1 });
         const selectedCats = Object.keys(categorySelections).filter(id => categorySelections[id]);
         let estimatedTotal = 0;
         for (const catId of selectedCats) {
             const catDef = scanner.CATEGORIES[catId];
             if (!catDef) continue;
+            let catCount = 0;
             for (const dir of (catDef.dirs || [])) {
                 const p = path.join(scanner.AG_ROOT, dir);
-                if (fs.existsSync(p)) estimatedTotal += countFiles(p);
+                if (fs.existsSync(p)) catCount += countFiles(p);
             }
-            estimatedTotal += (catDef.files || []).filter(f => fs.existsSync(path.join(scanner.AG_ROOT, f))).length;
-            estimatedTotal += (catDef.parentFiles || []).filter(f => fs.existsSync(path.join(scanner.GEMINI_ROOT, f))).length;
+            catCount += (catDef.files || []).filter(f => fs.existsSync(path.join(scanner.AG_ROOT, f))).length;
+            catCount += (catDef.parentFiles || []).filter(f => fs.existsSync(path.join(scanner.GEMINI_ROOT, f))).length;
+            estimatedTotal += catCount;
+            progress?.report({ message: `[2/7] Counted ${catDef.label}: ${catCount.toLocaleString()} files (total: ${estimatedTotal.toLocaleString()}, ${elapsed(t0)})` });
         }
         progress?.report({ message: `[2/7] ${estimatedTotal.toLocaleString()} files to stage. (${elapsed(t0)})`, increment: 2 });
 
