@@ -203,11 +203,30 @@ function elapsed(startMs) {
     return `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
+// ── Directories to SKIP during sync (junk/build artifacts) ──────────────────
+const SKIP_DIRS = new Set([
+    'node_modules', '.git', '__pycache__', '.venv', 'venv', '.env',
+    'dist', 'build', '.next', '.cache', '.tsbuildinfo',
+    '.mypy_cache', '.pytest_cache', '.ruff_cache',
+    'target', 'bin', 'obj',  // Rust/C#
+    'vendor',
+    '.angular', '.svelte-kit'
+]);
+const SKIP_EXTS = new Set(['.vsix', '.pack', '.idx']);
+
+function shouldSkip(name) {
+    if (SKIP_DIRS.has(name)) return true;
+    const ext = path.extname(name).toLowerCase();
+    if (SKIP_EXTS.has(ext)) return true;
+    return false;
+}
+
 // ── Tracked copy: reports progress every N files ────────────────────────────
 function copyDirTracked(src, dst, tracker) {
     fs.mkdirSync(dst, { recursive: true });
     try {
         for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+            if (shouldSkip(entry.name)) continue;
             const s = path.join(src, entry.name), d = path.join(dst, entry.name);
             try {
                 if (entry.isDirectory()) {
@@ -536,6 +555,7 @@ function copyDirRecursive(src, dst) {
     fs.mkdirSync(dst, { recursive: true });
     try {
         for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+            if (shouldSkip(entry.name)) continue;
             const s = path.join(src, entry.name), d = path.join(dst, entry.name);
             try { entry.isDirectory() ? copyDirRecursive(s, d) : fs.copyFileSync(s, d); } catch (e) { }
         }
@@ -547,6 +567,7 @@ function mergeDirRecursive(src, dst, mode) {
     fs.mkdirSync(dst, { recursive: true });
     try {
         for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+            if (shouldSkip(entry.name)) continue;
             const s = path.join(src, entry.name), d = path.join(dst, entry.name);
             if (entry.isDirectory()) {
                 const sub = mergeDirRecursive(s, d, mode);
@@ -570,7 +591,12 @@ function mergeFile(src, dst, mode) {
 
 function countFiles(dir) {
     let count = 0;
-    try { for (const e of fs.readdirSync(dir, { withFileTypes: true })) count += e.isDirectory() ? countFiles(path.join(dir, e.name)) : 1; } catch (e) { }
+    try {
+        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+            if (shouldSkip(e.name)) continue;
+            count += e.isDirectory() ? countFiles(path.join(dir, e.name)) : 1;
+        }
+    } catch (e) { }
     return count;
 }
 
