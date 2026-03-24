@@ -203,22 +203,9 @@ function elapsed(startMs) {
     return `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
-// ── Directories to SKIP during sync (junk/build artifacts) ──────────────────
-const SKIP_DIRS = new Set([
-    'node_modules', '.git', '__pycache__', '.venv', 'venv', '.env',
-    'dist', 'build', '.next', '.cache', '.tsbuildinfo',
-    '.mypy_cache', '.pytest_cache', '.ruff_cache',
-    'target', 'bin', 'obj',  // Rust/C#
-    'vendor',
-    '.angular', '.svelte-kit'
-]);
-const SKIP_EXTS = new Set(['.vsix', '.pack', '.idx']);
-
+// ── Only skip .git dirs (would conflict with sync repo's own git) ────────────
 function shouldSkip(name) {
-    if (SKIP_DIRS.has(name)) return true;
-    const ext = path.extname(name).toLowerCase();
-    if (SKIP_EXTS.has(ext)) return true;
-    return false;
+    return name === '.git';
 }
 
 // ── Tracked copy: reports progress every N files ────────────────────────────
